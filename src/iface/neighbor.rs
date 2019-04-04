@@ -157,7 +157,7 @@ impl<'a> Cache<'a> {
         }
     }
 
-    pub(crate) fn lookup_pure(&self, protocol_addr: &IpAddress, timestamp: Instant) ->
+    pub fn lookup_pure(&self, protocol_addr: &IpAddress, timestamp: Instant) ->
                              Option<EthernetAddress> {
         if protocol_addr.is_broadcast() {
             return Some(EthernetAddress::BROADCAST)
