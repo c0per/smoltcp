@@ -445,6 +445,14 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
         &mut self.inner.routes
     }
 
+    pub fn neighbor_cache(&self) -> &NeighborCache<'b> {
+        &self.inner.neighbor_cache
+    }
+
+    pub fn neighbor_cache_mut(&mut self) -> &mut NeighborCache<'b> {
+        &mut self.inner.neighbor_cache
+    }
+
     /// Transmit packets queued in the given sockets, and receive packets queued
     /// in the device.
     ///
