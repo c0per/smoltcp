@@ -66,7 +66,7 @@ enum Timer {
 }
 
 const RETRANSMIT_DELAY: Duration = Duration { millis: 100 };
-const CLOSE_DELAY:      Duration = Duration { millis: 10_000 };
+const CLOSE_DELAY:      Duration = Duration { millis: 1000 };
 
 impl Default for Timer {
     fn default() -> Timer {
