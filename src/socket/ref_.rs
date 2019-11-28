@@ -32,8 +32,12 @@ impl<'a> Session for TcpSocket<'a> {}
 ///
 /// Allows the network stack to efficiently determine if the socket state was changed in any way.
 pub struct Ref<'a, T: Session + 'a> {
-    socket:   &'a mut T,
-    consumed: bool,
+    /// Reference to the socket.
+    ///
+    /// This is almost always `Some` except when dropped in `into_inner` which removes the socket
+    /// reference. This properly tracks the initialization state without any additional bytes as
+    /// the `None` variant occupies the `0` pattern which is invalid for the reference.
+    socket: Option<&'a mut T>,
 }
 
 impl<'a, T: Session + 'a> Ref<'a, T> {
@@ -43,7 +47,7 @@ impl<'a, T: Session + 'a> Ref<'a, T> {
     ///
     /// [into_inner]: #method.into_inner
     pub fn new(socket: &'a mut T) -> Self {
-        Ref { socket, consumed: false }
+        Ref { socket: Some(socket) }
     }
 
     /// Unwrap a smart pointer to a socket.
@@ -55,10 +59,9 @@ impl<'a, T: Session + 'a> Ref<'a, T> {
     /// map a `&mut SocketRef<'a, XSocket>` to a `&'a mut XSocket` (note the lifetimes);
     /// be sure to call [new] afterwards.
     ///
-    /// [new_unchecked]: #method.new_unchecked
+    /// [new]: #method.new
     pub fn into_inner(mut ref_: Self) -> &'a mut T {
-        ref_.consumed = true;
-        ref_.socket
+        ref_.socket.take().unwrap()
     }
 }
 
@@ -66,20 +69,21 @@ impl<'a, T: Session> Deref for Ref<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.socket
+        // Deref is only used while the socket is still in place (into inner has not been called).
+        self.socket.as_ref().unwrap()
     }
 }
 
 impl<'a, T: Session> DerefMut for Ref<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.socket
+        self.socket.as_mut().unwrap()
     }
 }
 
 impl<'a, T: Session> Drop for Ref<'a, T> {
     fn drop(&mut self) {
-        if !self.consumed {
-            Session::finish(self.socket);
+        if let Some(socket) = self.socket.take() {
+            Session::finish(socket);
         }
     }
 }

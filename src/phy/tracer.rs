@@ -19,6 +19,21 @@ impl<D: for<'a> Device<'a>, P: PrettyPrint> Tracer<D, P> {
         Tracer { inner, writer }
     }
 
+    /// Get a reference to the underlying device.
+    ///
+    /// Even if the device offers reading through a standard reference, it is inadvisable to
+    /// directly read from the device as doing so will circumvent the tracing.
+    pub fn get_ref(&self) -> &D {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the underlying device.
+    ///
+    /// It is inadvisable to directly read from the device as doing so will circumvent the tracing.
+    pub fn get_mut(&mut self) -> &mut D {
+        &mut self.inner
+    }
+
     /// Return the underlying device, consuming the tracer.
     pub fn into_inner(self) -> D {
         self.inner
@@ -59,7 +74,7 @@ pub struct RxToken<Rx: phy::RxToken, P: PrettyPrint> {
 
 impl<Rx: phy::RxToken, P: PrettyPrint> phy::RxToken for RxToken<Rx, P> {
     fn consume<R, F>(self, timestamp: Instant, f: F) -> Result<R>
-        where F: FnOnce(&[u8]) -> Result<R>
+        where F: FnOnce(&mut [u8]) -> Result<R>
     {
         let Self { token, writer } = self;
         token.consume(timestamp, |buffer| {

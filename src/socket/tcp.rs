@@ -640,6 +640,18 @@ impl<'a> TcpSocket<'a> {
         !self.tx_buffer.is_full()
     }
 
+    /// Return the maximum number of bytes inside the recv buffer.
+    #[inline]
+    pub fn recv_capacity(&self) -> usize {
+        self.rx_buffer.capacity()
+    }
+
+    /// Return the maximum number of bytes inside the transmit buffer.
+    #[inline]
+    pub fn send_capacity(&self) -> usize {
+        self.tx_buffer.capacity()
+    }
+
     /// Check whether the receive half of the full-duplex connection buffer is open
     /// (see [may_recv](#method.may_recv), and the receive buffer is not empty.
     #[inline]
@@ -683,7 +695,7 @@ impl<'a> TcpSocket<'a> {
 
     /// Enqueue a sequence of octets to be sent, and fill it from a slice.
     ///
-    /// This function returns the amount of bytes actually enqueued, which is limited
+    /// This function returns the amount of octets actually enqueued, which is limited
     /// by the amount of free space in the transmit buffer; down to zero.
     ///
     /// See also [send](#method.send).
@@ -716,7 +728,7 @@ impl<'a> TcpSocket<'a> {
     /// Call `f` with the largest contiguous slice of octets in the receive buffer,
     /// and dequeue the amount of elements returned by `f`.
     ///
-    /// This function returns `Err(Error::Illegal) if the receive half of
+    /// This function returns `Err(Error::Illegal)` if the receive half of
     /// the connection is not open; see [may_recv](#method.may_recv).
     pub fn recv<'b, F, R>(&'b mut self, f: F) -> Result<R>
             where F: FnOnce(&'b mut [u8]) -> (usize, R) {
@@ -727,8 +739,8 @@ impl<'a> TcpSocket<'a> {
 
     /// Dequeue a sequence of received octets, and fill a slice from it.
     ///
-    /// This function returns the amount of bytes actually dequeued, which is limited
-    /// by the amount of free space in the transmit buffer; down to zero.
+    /// This function returns the amount of octets actually dequeued, which is limited
+    /// by the amount of occupied space in the receive buffer; down to zero.
     ///
     /// See also [recv](#method.recv).
     pub fn recv_slice(&mut self, data: &mut [u8]) -> Result<usize> {
@@ -774,7 +786,9 @@ impl<'a> TcpSocket<'a> {
         self.tx_buffer.len()
     }
 
-    /// Return the amount of octets queued in the receive buffer.
+    /// Return the amount of octets queued in the receive buffer. This value can be larger than
+    /// the slice read by the next `recv` or `peek` call because it includes all queued octets,
+    /// and not only the octets that may be returned as a contiguous slice.
     ///
     /// Note that the Berkeley sockets interface does not have an equivalent of this API.
     pub fn recv_queue(&self) -> usize {
@@ -1644,8 +1658,8 @@ impl<'a> TcpSocket<'a> {
     }
 }
 
-impl<'a> Into<Socket<'a, 'static>> for TcpSocket<'a> {
-    fn into(self) -> Socket<'a, 'static> {
+impl<'a> Into<Socket<'a, 'a>> for TcpSocket<'a> {
+    fn into(self) -> Socket<'a, 'a> {
         Socket::Tcp(self)
     }
 }
@@ -1814,24 +1828,26 @@ mod test {
     #[cfg(feature = "log")]
     fn init_logger() {
         extern crate log;
-        use std::boxed::Box;
 
-        struct Logger(());
+        struct Logger;
+        static LOGGER: Logger = Logger;
 
         impl log::Log for Logger {
-            fn enabled(&self, _metadata: &log::LogMetadata) -> bool {
+            fn enabled(&self, _metadata: &log::Metadata) -> bool {
                 true
             }
 
-            fn log(&self, record: &log::LogRecord) {
+            fn log(&self, record: &log::Record) {
                 println!("{}", record.args());
+            }
+
+            fn flush(&self) {
             }
         }
 
-        let _ = log::set_logger(|max_level| {
-            max_level.set(log::LogLevelFilter::Trace);
-            Box::new(Logger(()))
-        });
+        // If it fails, that just means we've already set it to the same value.
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Trace);
 
         println!("");
     }
@@ -3897,7 +3913,7 @@ mod test {
         s.local_rx_dup_acks = u8::max_value() - 1;
 
         // Send 3 more ACKs, which could overflow local_rx_dup_acks,
-        // but intended behaviour is that we saturate the bounds 
+        // but intended behaviour is that we saturate the bounds
         // of local_rx_dup_acks
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,

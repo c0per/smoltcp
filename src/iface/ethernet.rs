@@ -353,6 +353,22 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
         InterfaceInner::check_ethernet_addr(&self.inner.ethernet_addr);
     }
 
+    /// Get a reference to the inner device.
+    pub fn device(&self) -> &DeviceT {
+        &self.device
+    }
+
+    /// Get a mutable reference to the inner device.
+    ///
+    /// There are no invariants imposed on the device by the interface itself. Furthermore the
+    /// trait implementations, required for references of all lifetimes, guarantees that the
+    /// mutable reference can not invalidate the device as such. For some devices, such access may
+    /// still allow modifications with adverse effects on the usability as a `phy` device. You
+    /// should not use them this way.
+    pub fn device_mut(&mut self) -> &mut DeviceT {
+        &mut self.device
+    }
+
     /// Add an address to a list of subscribed multicast IP addresses.
     ///
     /// Returns `Ok(announce_sent)` if the address was added successfully, where `annouce_sent`
@@ -415,6 +431,16 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
     /// Get the IP addresses of the interface.
     pub fn ip_addrs(&self) -> &[IpCidr] {
         self.inner.ip_addrs.as_ref()
+    }
+
+    /// Get the first IPv4 address if present.
+    #[cfg(feature = "proto-ipv4")]
+    pub fn ipv4_addr(&self) -> Option<Ipv4Address> {
+        self.ip_addrs().iter()
+            .filter_map(|cidr| match cidr.address() {
+                IpAddress::Ipv4(addr) => Some(addr),
+                _ => None,
+            }).next()
     }
 
     /// Update the IP addresses of the interface.
@@ -690,7 +716,7 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
 
     fn check_ip_addrs(addrs: &[IpCidr]) {
         for cidr in addrs {
-            if !cidr.address().is_unicast() {
+            if !cidr.address().is_unicast() && !cidr.address().is_unspecified() {
                 panic!("IP address {} is not unicast", cidr.address())
             }
         }
@@ -832,8 +858,8 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
             match raw_socket.process(&ip_repr, ip_payload, &checksum_caps) {
                 // The packet is valid and handled by socket.
                 Ok(()) => handled_by_raw_socket = true,
-                // The socket buffer is full.
-                Err(Error::Exhausted) => (),
+                // The socket buffer is full or the packet was truncated
+                Err(Error::Exhausted) | Err(Error::Truncated) => (),
                 // Raw sockets don't validate the packets in any way.
                 Err(_) => unreachable!(),
             }
@@ -890,7 +916,7 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
 
             #[cfg(feature = "socket-udp")]
             IpProtocol::Udp =>
-                self.process_udp(sockets, ipv6_repr.into(), ip_payload),
+                self.process_udp(sockets, ipv6_repr.into(), handled_by_raw_socket, ip_payload),
 
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp =>
@@ -948,9 +974,13 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
 
         #[cfg(feature = "socket-raw")]
         let handled_by_raw_socket = self.raw_socket_filter(sockets, &ip_repr, ip_payload);
+        #[cfg(not(feature = "socket-raw"))]
+        let handled_by_raw_socket = false;
 
-        if !self.has_ip_addr(ipv4_repr.dst_addr) && !self.has_multicast_group(ipv4_repr.dst_addr) {
-            // Ignore IP packets not directed at us or any of the multicast groups
+        if !self.has_ip_addr(ipv4_repr.dst_addr) &&
+           !ipv4_repr.dst_addr.is_broadcast() &&
+           !self.has_multicast_group(ipv4_repr.dst_addr) {
+            // Ignore IP packets not directed at us, or broadcast, or any of the multicast groups.
             // If AnyIP is enabled, also check if the packet is routed locally.
             if !self.any_ip {
                 return Ok(Packet::None);
@@ -972,13 +1002,12 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
 
             #[cfg(feature = "socket-udp")]
             IpProtocol::Udp =>
-                self.process_udp(sockets, ip_repr, ip_payload),
+                self.process_udp(sockets, ip_repr, handled_by_raw_socket, ip_payload),
 
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp =>
                 self.process_tcp(sockets, timestamp, ip_repr, ip_payload),
 
-            #[cfg(feature = "socket-raw")]
             _ if handled_by_raw_socket =>
                 Ok(Packet::None),
 
@@ -1250,7 +1279,11 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
                    (&self, ipv4_repr: Ipv4Repr, icmp_repr: Icmpv4Repr<'icmp>) ->
                    Packet<'frame>
     {
-        if ipv4_repr.dst_addr.is_unicast() {
+        if !ipv4_repr.src_addr.is_unicast() {
+            // Do not send ICMP replies to non-unicast sources
+            Packet::None
+        } else if ipv4_repr.dst_addr.is_unicast() {
+            // Reply as normal when src_addr and dst_addr are both unicast
             let ipv4_reply_repr = Ipv4Repr {
                 src_addr:    ipv4_repr.dst_addr,
                 dst_addr:    ipv4_repr.src_addr,
@@ -1259,8 +1292,25 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
                 hop_limit:   64
             };
             Packet::Icmpv4((ipv4_reply_repr, icmp_repr))
+        } else if ipv4_repr.dst_addr.is_broadcast() {
+            // Only reply to broadcasts for echo replies and not other ICMP messages
+            match icmp_repr {
+                Icmpv4Repr::EchoReply {..} => match self.ipv4_address() {
+                    Some(src_addr) => {
+                        let ipv4_reply_repr = Ipv4Repr {
+                            src_addr:    src_addr,
+                            dst_addr:    ipv4_repr.src_addr,
+                            protocol:    IpProtocol::Icmp,
+                            payload_len: icmp_repr.buffer_len(),
+                            hop_limit:   64
+                        };
+                        Packet::Icmpv4((ipv4_reply_repr, icmp_repr))
+                    },
+                    None => Packet::None,
+                },
+                _ => Packet::None,
+            }
         } else {
-            // Do not send any ICMP replies to a broadcast destination address.
             Packet::None
         }
     }
@@ -1287,7 +1337,7 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
 
     #[cfg(feature = "socket-udp")]
     fn process_udp<'frame>(&self, sockets: &mut SocketSet,
-                           ip_repr: IpRepr, ip_payload: &'frame [u8]) ->
+                           ip_repr: IpRepr, handled_by_raw_socket: bool, ip_payload: &'frame [u8]) ->
                           Result<Packet<'frame>>
     {
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
@@ -1308,6 +1358,12 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
 
         // The packet wasn't handled by a socket, send an ICMP port unreachable packet.
         match ip_repr {
+            #[cfg(feature = "proto-ipv4")]
+            IpRepr::Ipv4(_) if handled_by_raw_socket =>
+                Ok(Packet::None),
+            #[cfg(feature = "proto-ipv6")]
+            IpRepr::Ipv6(_) if handled_by_raw_socket =>
+                Ok(Packet::None),
             #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(ipv4_repr) => {
                 let payload_len = icmp_reply_payload_len(ip_payload.len(), IPV4_MIN_MTU,
@@ -1930,7 +1986,7 @@ mod test {
 
         // Ensure that the unknown protocol triggers an error response.
         // And we correctly handle no payload.
-        assert_eq!(iface.inner.process_udp(&mut socket_set, ip_repr, data),
+        assert_eq!(iface.inner.process_udp(&mut socket_set, ip_repr, false, data),
                    Ok(expected_repr));
 
         let ip_repr = IpRepr::Ipv4(Ipv4Repr {
@@ -1950,7 +2006,7 @@ mod test {
         // ICMP error response when the destination address is a
         // broadcast address and no socket is bound to the port.
         assert_eq!(iface.inner.process_udp(&mut socket_set, ip_repr,
-                   packet_broadcast.into_inner()), Ok(Packet::None));
+                   false, packet_broadcast.into_inner()), Ok(Packet::None));
     }
 
     #[test]
@@ -2013,7 +2069,7 @@ mod test {
                       &ChecksumCapabilities::default());
 
         // Packet should be handled by bound UDP socket
-        assert_eq!(iface.inner.process_udp(&mut socket_set, ip_repr, packet.into_inner()),
+        assert_eq!(iface.inner.process_udp(&mut socket_set, ip_repr, false, packet.into_inner()),
                    Ok(Packet::None));
 
         {
@@ -2023,6 +2079,64 @@ mod test {
             assert!(socket.can_recv());
             assert_eq!(socket.recv(), Ok((&UDP_PAYLOAD[..], IpEndpoint::new(src_ip.into(), 67))));
         }
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn test_handle_ipv4_broadcast() {
+        use wire::{Ipv4Packet, Icmpv4Repr, Icmpv4Packet};
+
+        let (mut iface, mut socket_set) = create_loopback();
+
+        let our_ipv4_addr = iface.ipv4_address().unwrap();
+        let src_ipv4_addr = Ipv4Address([127, 0, 0, 2]);
+
+        // ICMPv4 echo request
+        let icmpv4_data: [u8; 4] = [0xaa, 0x00, 0x00, 0xff];
+        let icmpv4_repr = Icmpv4Repr::EchoRequest {
+            ident: 0x1234, seq_no: 0xabcd, data: &icmpv4_data
+        };
+
+        // Send to IPv4 broadcast address
+        let ipv4_repr = Ipv4Repr {
+            src_addr:    src_ipv4_addr,
+            dst_addr:    Ipv4Address::BROADCAST,
+            protocol:    IpProtocol::Icmp,
+            hop_limit:   64,
+            payload_len: icmpv4_repr.buffer_len(),
+        };
+
+        // Emit to ethernet frame
+        let mut eth_bytes = vec![0u8;
+            EthernetFrame::<&[u8]>::header_len() +
+            ipv4_repr.buffer_len() + icmpv4_repr.buffer_len()
+        ];
+        let frame = {
+            let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
+            ipv4_repr.emit(
+                &mut Ipv4Packet::new_unchecked(frame.payload_mut()),
+                &ChecksumCapabilities::default());
+            icmpv4_repr.emit(
+                &mut Icmpv4Packet::new_unchecked(
+                    &mut frame.payload_mut()[ipv4_repr.buffer_len()..]),
+                &ChecksumCapabilities::default());
+            EthernetFrame::new_unchecked(&*frame.into_inner())
+        };
+
+        // Expected ICMPv4 echo reply
+        let expected_icmpv4_repr = Icmpv4Repr::EchoReply {
+            ident: 0x1234, seq_no: 0xabcd, data: &icmpv4_data };
+        let expected_ipv4_repr = Ipv4Repr {
+            src_addr: our_ipv4_addr,
+            dst_addr: src_ipv4_addr,
+            protocol: IpProtocol::Icmp,
+            hop_limit: 64,
+            payload_len: expected_icmpv4_repr.buffer_len(),
+        };
+        let expected_packet = Packet::Icmpv4((expected_ipv4_repr, expected_icmpv4_repr));
+
+        assert_eq!(iface.inner.process_ipv4(&mut socket_set, Instant::from_millis(0), &frame),
+                   Ok(expected_packet));
     }
 
     #[test]
@@ -2106,17 +2220,17 @@ mod test {
             dst_addr: src_addr,
             protocol: IpProtocol::Icmp,
             hop_limit: 64,
-            payload_len: expected_icmpv4_repr.buffer_len()
+            payload_len: expected_icmp_repr.buffer_len()
         };
 
         // The expected packet does not exceed the IPV4_MIN_MTU
         assert_eq!(expected_ip_repr.buffer_len() + expected_icmp_repr.buffer_len(), MIN_MTU);
         // The expected packet and the generated packet are equal
         #[cfg(all(feature = "proto-ipv4", not(feature = "proto-ipv6")))]
-        assert_eq!(iface.inner.process_udp(&mut socket_set, ip_repr.into(), payload),
+        assert_eq!(iface.inner.process_udp(&mut socket_set, ip_repr.into(), false, payload),
                    Ok(Packet::Icmpv4((expected_ip_repr, expected_icmp_repr))));
         #[cfg(feature = "proto-ipv6")]
-        assert_eq!(iface.inner.process_udp(&mut socket_set, ip_repr.into(), payload),
+        assert_eq!(iface.inner.process_udp(&mut socket_set, ip_repr.into(), false, payload),
                    Ok(Packet::Icmpv6((expected_ip_repr, expected_icmp_repr))));
     }
 
@@ -2502,6 +2616,201 @@ mod test {
             assert_eq!(leaves[i].0.protocol, IpProtocol::Igmp);
             assert_eq!(leaves[i].0.dst_addr, Ipv4Address::MULTICAST_ALL_ROUTERS);
             assert_eq!(leaves[i].1, IgmpRepr::LeaveGroup { group_addr });
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "proto-ipv4", feature = "socket-raw"))]
+    fn test_raw_socket_no_reply() {
+        use socket::{RawSocket, RawSocketBuffer, RawPacketMetadata};
+        use wire::{IpVersion, Ipv4Packet, UdpPacket, UdpRepr};
+
+        let (mut iface, mut socket_set) = create_loopback();
+
+        let packets = 1;
+        let rx_buffer = RawSocketBuffer::new(vec![RawPacketMetadata::EMPTY; packets], vec![0; 48 * 1]);
+        let tx_buffer = RawSocketBuffer::new(vec![RawPacketMetadata::EMPTY; packets], vec![0; 48 * packets]);
+        let raw_socket = RawSocket::new(IpVersion::Ipv4, IpProtocol::Udp, rx_buffer, tx_buffer);
+        socket_set.add(raw_socket);
+
+        let src_addr = Ipv4Address([127, 0, 0, 2]);
+        let dst_addr = Ipv4Address([127, 0, 0, 1]);
+
+        let udp_repr = UdpRepr {
+            src_port: 67,
+            dst_port: 68,
+            payload: &[0x2a; 10]
+        };
+        let mut bytes = vec![0xff; udp_repr.buffer_len()];
+        let mut packet = UdpPacket::new_unchecked(&mut bytes[..]);
+        udp_repr.emit(&mut packet, &src_addr.into(), &dst_addr.into(), &ChecksumCapabilities::default());
+        let ipv4_repr = Ipv4Repr {
+            src_addr: src_addr,
+            dst_addr: dst_addr,
+            protocol: IpProtocol::Udp,
+            hop_limit: 64,
+            payload_len: udp_repr.buffer_len()
+        };
+
+        // Emit to ethernet frame
+        let mut eth_bytes = vec![0u8;
+            EthernetFrame::<&[u8]>::header_len() +
+            ipv4_repr.buffer_len() + udp_repr.buffer_len()
+        ];
+        let frame = {
+            let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
+            ipv4_repr.emit(
+                &mut Ipv4Packet::new_unchecked(frame.payload_mut()),
+                &ChecksumCapabilities::default());
+            udp_repr.emit(
+                &mut UdpPacket::new_unchecked(
+                    &mut frame.payload_mut()[ipv4_repr.buffer_len()..]),
+                &src_addr.into(),
+                &dst_addr.into(),
+                &ChecksumCapabilities::default());
+            EthernetFrame::new_unchecked(&*frame.into_inner())
+        };
+
+        assert_eq!(iface.inner.process_ipv4(&mut socket_set, Instant::from_millis(0), &frame),
+                   Ok(Packet::None));
+    }
+
+    #[test]
+    #[cfg(all(feature = "proto-ipv4", feature = "socket-raw"))]
+    fn test_raw_socket_truncated_packet() {
+        use socket::{RawSocket, RawSocketBuffer, RawPacketMetadata};
+        use wire::{IpVersion, Ipv4Packet, UdpPacket, UdpRepr};
+
+        let (mut iface, mut socket_set) = create_loopback();
+
+        let packets = 1;
+        let rx_buffer = RawSocketBuffer::new(vec![RawPacketMetadata::EMPTY; packets], vec![0; 48 * 1]);
+        let tx_buffer = RawSocketBuffer::new(vec![RawPacketMetadata::EMPTY; packets], vec![0; 48 * packets]);
+        let raw_socket = RawSocket::new(IpVersion::Ipv4, IpProtocol::Udp, rx_buffer, tx_buffer);
+        socket_set.add(raw_socket);
+
+        let src_addr = Ipv4Address([127, 0, 0, 2]);
+        let dst_addr = Ipv4Address([127, 0, 0, 1]);
+
+        let udp_repr = UdpRepr {
+            src_port: 67,
+            dst_port: 68,
+            payload: &[0x2a; 49] // 49 > 48, hence packet will be truncated
+        };
+        let mut bytes = vec![0xff; udp_repr.buffer_len()];
+        let mut packet = UdpPacket::new_unchecked(&mut bytes[..]);
+        udp_repr.emit(&mut packet, &src_addr.into(), &dst_addr.into(), &ChecksumCapabilities::default());
+        let ipv4_repr = Ipv4Repr {
+            src_addr: src_addr,
+            dst_addr: dst_addr,
+            protocol: IpProtocol::Udp,
+            hop_limit: 64,
+            payload_len: udp_repr.buffer_len()
+        };
+
+        // Emit to ethernet frame
+        let mut eth_bytes = vec![0u8;
+            EthernetFrame::<&[u8]>::header_len() +
+            ipv4_repr.buffer_len() + udp_repr.buffer_len()
+        ];
+        let frame = {
+            let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
+            ipv4_repr.emit(
+                &mut Ipv4Packet::new_unchecked(frame.payload_mut()),
+                &ChecksumCapabilities::default());
+            udp_repr.emit(
+                &mut UdpPacket::new_unchecked(
+                    &mut frame.payload_mut()[ipv4_repr.buffer_len()..]),
+                &src_addr.into(),
+                &dst_addr.into(),
+                &ChecksumCapabilities::default());
+            EthernetFrame::new_unchecked(&*frame.into_inner())
+        };
+
+        let frame = iface.inner.process_ipv4(&mut socket_set, Instant::from_millis(0), &frame);
+
+        // because the packet could not be handled we should send an Icmp message
+        assert!(match frame {  
+            Ok(Packet::Icmpv4(_)) => true,
+            _ => false,
+        });
+    }
+
+    #[test]
+    #[cfg(all(feature = "proto-ipv4", feature = "socket-raw", feature = "socket-udp"))]
+    fn test_raw_socket_with_udp_socket() {
+        use socket::{UdpSocket, UdpSocketBuffer, UdpPacketMetadata,
+                     RawSocket, RawSocketBuffer, RawPacketMetadata};
+        use wire::{IpVersion, IpEndpoint, Ipv4Packet, UdpPacket, UdpRepr};
+
+        static UDP_PAYLOAD: [u8; 5] = [0x48, 0x65, 0x6c, 0x6c, 0x6f];
+
+        let (mut iface, mut socket_set) = create_loopback();
+
+        let udp_rx_buffer = UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY], vec![0; 15]);
+        let udp_tx_buffer = UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY], vec![0; 15]);
+        let udp_socket = UdpSocket::new(udp_rx_buffer, udp_tx_buffer);
+        let udp_socket_handle = socket_set.add(udp_socket);
+        {
+            // Bind the socket to port 68
+            let mut socket = socket_set.get::<UdpSocket>(udp_socket_handle);
+            assert_eq!(socket.bind(68), Ok(()));
+            assert!(!socket.can_recv());
+            assert!(socket.can_send());
+        }
+
+        let packets = 1;
+        let raw_rx_buffer = RawSocketBuffer::new(vec![RawPacketMetadata::EMPTY; packets], vec![0; 48 * 1]);
+        let raw_tx_buffer = RawSocketBuffer::new(vec![RawPacketMetadata::EMPTY; packets], vec![0; 48 * packets]);
+        let raw_socket = RawSocket::new(IpVersion::Ipv4, IpProtocol::Udp, raw_rx_buffer, raw_tx_buffer);
+        socket_set.add(raw_socket);
+
+        let src_addr = Ipv4Address([127, 0, 0, 2]);
+        let dst_addr = Ipv4Address([127, 0, 0, 1]);
+
+        let udp_repr = UdpRepr {
+            src_port: 67,
+            dst_port: 68,
+            payload: &UDP_PAYLOAD
+        };
+        let mut bytes = vec![0xff; udp_repr.buffer_len()];
+        let mut packet = UdpPacket::new_unchecked(&mut bytes[..]);
+        udp_repr.emit(&mut packet, &src_addr.into(), &dst_addr.into(), &ChecksumCapabilities::default());
+        let ipv4_repr = Ipv4Repr {
+            src_addr: src_addr,
+            dst_addr: dst_addr,
+            protocol: IpProtocol::Udp,
+            hop_limit: 64,
+            payload_len: udp_repr.buffer_len()
+        };
+
+        // Emit to ethernet frame
+        let mut eth_bytes = vec![0u8;
+            EthernetFrame::<&[u8]>::header_len() +
+            ipv4_repr.buffer_len() + udp_repr.buffer_len()
+        ];
+        let frame = {
+            let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
+            ipv4_repr.emit(
+                &mut Ipv4Packet::new_unchecked(frame.payload_mut()),
+                &ChecksumCapabilities::default());
+            udp_repr.emit(
+                &mut UdpPacket::new_unchecked(
+                    &mut frame.payload_mut()[ipv4_repr.buffer_len()..]),
+                &src_addr.into(),
+                &dst_addr.into(),
+                &ChecksumCapabilities::default());
+            EthernetFrame::new_unchecked(&*frame.into_inner())
+        };
+
+        assert_eq!(iface.inner.process_ipv4(&mut socket_set, Instant::from_millis(0), &frame),
+                   Ok(Packet::None));
+
+        {
+            // Make sure the UDP socket can still receive in presence of a Raw socket that handles UDP
+            let mut socket = socket_set.get::<UdpSocket>(udp_socket_handle);
+            assert!(socket.can_recv());
+            assert_eq!(socket.recv(), Ok((&UDP_PAYLOAD[..], IpEndpoint::new(src_addr.into(), 67))));
         }
     }
 }

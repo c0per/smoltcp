@@ -214,12 +214,10 @@ impl<'a> Repr<'a> {
         // Valid checksum is expected...
         if checksum_caps.udp.rx() && !packet.verify_checksum(src_addr, dst_addr) {
             match (src_addr, dst_addr) {
+                // ... except on UDP-over-IPv4, where it can be omitted.
                 #[cfg(feature = "proto-ipv4")]
                 (&IpAddress::Ipv4(_), &IpAddress::Ipv4(_))
-                        if packet.checksum() != 0 => {
-                    // ... except on UDP-over-IPv4, where it can be omitted.
-                    return Err(Error::Checksum)
-                },
+                    if packet.checksum() == 0 => (),
                 _ => {
                     return Err(Error::Checksum)
                 }
@@ -277,7 +275,7 @@ impl<'a> fmt::Display for Repr<'a> {
 use super::pretty_print::{PrettyPrint, PrettyIndent};
 
 impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
-    fn pretty_print(buffer: &AsRef<[u8]>, f: &mut fmt::Formatter,
+    fn pretty_print(buffer: &dyn AsRef<[u8]>, f: &mut fmt::Formatter,
                     indent: &mut PrettyIndent) -> fmt::Result {
         match Packet::new_checked(buffer) {
             Err(err)   => write!(f, "{}({})", indent, err),
@@ -301,6 +299,12 @@ mod test {
     static PACKET_BYTES: [u8; 12] =
         [0xbf, 0x00, 0x00, 0x35,
          0x00, 0x0c, 0x12, 0x4d,
+         0xaa, 0x00, 0x00, 0xff];
+
+    #[cfg(feature = "proto-ipv4")]
+    static NO_CHECKSUM_PACKET: [u8; 12] =
+        [0xbf, 0x00, 0x00, 0x35,
+         0x00, 0x0c, 0x00, 0x00,
          0xaa, 0x00, 0x00, 0xff];
 
     #[cfg(feature = "proto-ipv4")]
@@ -380,5 +384,14 @@ mod test {
         repr.emit(&mut packet, &SRC_ADDR.into(), &DST_ADDR.into(),
                   &ChecksumCapabilities::default());
         assert_eq!(&packet.into_inner()[..], &PACKET_BYTES[..]);
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn test_checksum_omitted() {
+        let packet = Packet::new_unchecked(&NO_CHECKSUM_PACKET[..]);
+        let repr = Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into(),
+                               &ChecksumCapabilities::default()).unwrap();
+        assert_eq!(repr, packet_repr());
     }
 }

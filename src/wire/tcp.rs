@@ -893,11 +893,11 @@ impl<'a> Repr<'a> {
         packet.set_ack(self.ack_number.is_some());
         {
             let mut options = packet.options_mut();
-            if let Some(value) = self.window_scale {
-                let tmp = options; options = TcpOption::WindowScale(value).emit(tmp);
-            }
             if let Some(value) = self.max_seg_size {
                 let tmp = options; options = TcpOption::MaxSegmentSize(value).emit(tmp);
+            }
+            if let Some(value) = self.window_scale {
+                let tmp = options; options = TcpOption::WindowScale(value).emit(tmp);
             }
             if self.sack_permitted {
                 let tmp = options; options = TcpOption::SackPermitted.emit(tmp);
@@ -1012,7 +1012,7 @@ impl<'a> fmt::Display for Repr<'a> {
 use super::pretty_print::{PrettyPrint, PrettyIndent};
 
 impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
-    fn pretty_print(buffer: &AsRef<[u8]>, f: &mut fmt::Formatter,
+    fn pretty_print(buffer: &dyn AsRef<[u8]>, f: &mut fmt::Formatter,
                     indent: &mut PrettyIndent) -> fmt::Result {
         match Packet::new_checked(buffer) {
             Err(err)   => write!(f, "{}({})", indent, err),

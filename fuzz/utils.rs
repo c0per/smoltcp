@@ -1,57 +1,19 @@
-#![allow(dead_code)]
+// TODO: this is literally a copy of examples/utils.rs, but without an allow dead code attribute.
+// The include logic does not allow having attributes in included files.
 
 use std::cell::RefCell;
 use std::str::{self, FromStr};
 use std::rc::Rc;
-use std::io::{self, Write};
+use std::io;
 use std::fs::File;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::env;
 use std::process;
-#[cfg(feature = "log")]
-use log::{Level, LevelFilter};
-#[cfg(feature = "log")]
-use env_logger::Builder;
 use getopts::{Options, Matches};
 
 use smoltcp::phy::{Device, EthernetTracer, FaultInjector};
-#[cfg(feature = "phy-tap_interface")]
-use smoltcp::phy::TapInterface;
 use smoltcp::phy::{PcapWriter, PcapSink, PcapMode, PcapLinkType};
-use smoltcp::phy::RawSocket;
-use smoltcp::time::{Duration, Instant};
-
-#[cfg(feature = "log")]
-pub fn setup_logging_with_clock<F>(filter: &str, since_startup: F)
-        where F: Fn() -> Instant + Send + Sync + 'static {
-    Builder::new()
-        .format(move |buf, record| {
-            let elapsed = since_startup();
-            let timestamp = format!("[{}]", elapsed);
-            if record.target().starts_with("smoltcp::") {
-                writeln!(buf, "\x1b[0m{} ({}): {}\x1b[0m", timestamp,
-                         record.target().replace("smoltcp::", ""), record.args())
-            } else if record.level() == Level::Trace {
-                let message = format!("{}", record.args());
-                writeln!(buf, "\x1b[37m{} {}\x1b[0m", timestamp,
-                         message.replace("\n", "\n             "))
-            } else {
-                writeln!(buf, "\x1b[32m{} ({}): {}\x1b[0m", timestamp,
-                         record.target(), record.args())
-            }
-        })
-        .filter(None, LevelFilter::Trace)
-        .parse(filter)
-        .parse(&env::var("RUST_LOG").unwrap_or("".to_owned()))
-        .init();
-}
-
-#[cfg(feature = "log")]
-pub fn setup_logging(filter: &str) {
-    setup_logging_with_clock(filter, move  || {
-        Instant::now()
-    })
-}
+use smoltcp::time::Duration;
 
 pub fn create_options() -> (Options, Vec<&'static str>) {
     let mut opts = Options::new();
@@ -77,21 +39,6 @@ pub fn parse_options(options: &Options, free: Vec<&str>) -> Matches {
     }
 }
 
-pub fn add_tap_options(_opts: &mut Options, free: &mut Vec<&str>) {
-    free.push("INTERFACE");
-}
-
-#[cfg(feature = "phy-tap_interface")]
-pub fn parse_tap_options(matches: &mut Matches) -> TapInterface {
-    let interface = matches.free.remove(0);
-    TapInterface::new(&interface).unwrap()
-}
-
-pub fn parse_raw_socket_options(matches: &mut Matches) -> RawSocket {
-    let interface = matches.free.remove(0);
-    RawSocket::new(&interface).unwrap()
-}
-
 pub fn add_middleware_options(opts: &mut Options, _free: &mut Vec<&str>) {
     opts.optopt("", "pcap", "Write a packet capture file", "FILE");
     opts.optopt("", "drop-chance", "Chance of dropping a packet (%)", "CHANCE");
@@ -105,7 +52,7 @@ pub fn add_middleware_options(opts: &mut Options, _free: &mut Vec<&str>) {
 }
 
 pub fn parse_middleware_options<D>(matches: &mut Matches, device: D, loopback: bool)
-        -> FaultInjector<EthernetTracer<PcapWriter<D, Rc<dyn PcapSink>>>>
+        -> FaultInjector<EthernetTracer<PcapWriter<D, Rc<PcapSink>>>>
     where D: for<'a> Device<'a>
 {
     let drop_chance      = matches.opt_str("drop-chance").map(|s| u8::from_str(&s).unwrap())
@@ -121,7 +68,7 @@ pub fn parse_middleware_options<D>(matches: &mut Matches, device: D, loopback: b
     let shaping_interval = matches.opt_str("shaping-interval").map(|s| u64::from_str(&s).unwrap())
                                   .unwrap_or(0);
 
-    let pcap_writer: Box<dyn io::Write>;
+    let pcap_writer: Box<io::Write>;
     if let Some(pcap_filename) = matches.opt_str("pcap") {
         pcap_writer = Box::new(File::create(pcap_filename).expect("cannot open file"))
     } else {
@@ -130,7 +77,7 @@ pub fn parse_middleware_options<D>(matches: &mut Matches, device: D, loopback: b
 
     let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
 
-    let device = PcapWriter::new(device, Rc::new(RefCell::new(pcap_writer)) as Rc<dyn PcapSink>,
+    let device = PcapWriter::new(device, Rc::new(RefCell::new(pcap_writer)) as Rc<PcapSink>,
                                  if loopback { PcapMode::TxOnly } else { PcapMode::Both },
                                  PcapLinkType::Ethernet);
     let device = EthernetTracer::new(device, |_timestamp, _printer| {

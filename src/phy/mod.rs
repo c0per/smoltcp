@@ -56,14 +56,14 @@ impl<'a> phy::Device<'a> for StmPhy {
     }
 }
 
-struct StmPhyRxToken<'a>(&'a [u8]);
+struct StmPhyRxToken<'a>(&'a mut [u8]);
 
 impl<'a> phy::RxToken for StmPhyRxToken<'a> {
-    fn consume<R, F>(self, _timestamp: Instant, f: F) -> Result<R>
-        where F: FnOnce(&[u8]) -> Result<R>
+    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
+        where F: FnOnce(&mut [u8]) -> Result<R>
     {
         // TODO: receive packet into buffer
-        let result = f(self.0);
+        let result = f(&mut self.0);
         println!("rx called");
         result
     }
@@ -92,6 +92,7 @@ mod sys;
 
 mod tracer;
 mod fault_injector;
+mod fuzz_injector;
 mod pcap_writer;
 #[cfg(any(feature = "std", feature = "alloc"))]
 mod loopback;
@@ -105,6 +106,7 @@ pub use self::sys::wait;
 
 pub use self::tracer::Tracer;
 pub use self::fault_injector::FaultInjector;
+pub use self::fuzz_injector::{Fuzzer, FuzzInjector};
 pub use self::pcap_writer::{PcapLinkType, PcapMode, PcapSink, PcapWriter};
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use self::loopback::Loopback;
@@ -113,6 +115,7 @@ pub use self::raw_socket::RawSocket;
 #[cfg(all(feature = "phy-tap_interface", target_os = "linux"))]
 pub use self::tap_interface::TapInterface;
 
+#[cfg(feature = "ethernet")]
 /// A tracer device for Ethernet frames.
 pub type EthernetTracer<T> = Tracer<T, super::wire::EthernetFrame<&'static [u8]>>;
 
@@ -248,7 +251,7 @@ pub trait RxToken {
     /// The timestamp must be a number of milliseconds, monotonically increasing since an
     /// arbitrary moment in time, such as system startup.
     fn consume<R, F>(self, timestamp: Instant, f: F) -> Result<R>
-        where F: FnOnce(&[u8]) -> Result<R>;
+        where F: FnOnce(&mut [u8]) -> Result<R>;
 }
 
 /// A token to transmit a single network packet.
