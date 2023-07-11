@@ -88,6 +88,7 @@ impl<'a> phy::TxToken for StmPhyTxToken<'a> {
 "##
 )]
 
+use crate::iface::SocketSet;
 use crate::time::Instant;
 
 #[cfg(all(
@@ -370,6 +371,11 @@ pub trait RxToken {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R;
+
+    /// Preprocess the incomming packet before it is passed to the stack.
+    ///
+    /// e.g., prepare TCP sockets when received a SYN packet.
+    fn preprocess(&self, _sockets: &mut SocketSet<'_>) {}
 
     /// The Packet ID associated with the frame received by this [`RxToken`]
     fn meta(&self) -> PacketMeta {
